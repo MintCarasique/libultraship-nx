@@ -25,6 +25,8 @@ class Switch {
     static void ImGuiProcessEvent(bool wantsTextInput);
     static bool IsRunning();
     static void GetDisplaySize(int* width, int* height);
+    // Bit i set: player slot i has a controller (slot 0 includes the handheld Joy-Cons)
+    static uint32_t GetConnectedPadSlots();
     static void ApplyOverclock();
     static void ThrowMissingOTR(const std::string& otrPath);
     // Moves the calling thread off the main core (all threads start on core 0 under libnx)

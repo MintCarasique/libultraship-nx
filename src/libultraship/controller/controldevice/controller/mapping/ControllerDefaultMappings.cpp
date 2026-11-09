@@ -71,6 +71,25 @@ void ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings(
         return;
     }
 
+#ifdef __SWITCH__
+    // Twin-stick layout: the right stick moves the camera (Free Look) and aims, so the C buttons
+    // go on buttons: Y/X = C-left/C-right, R = C-down, right stick click = C-up.
+    Ship::ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings({
+        { BTN_A, { SDL_CONTROLLER_BUTTON_A } },
+        { BTN_B, { SDL_CONTROLLER_BUTTON_B } },
+        { BTN_L, { SDL_CONTROLLER_BUTTON_LEFTSHOULDER } },
+        { BTN_START, { SDL_CONTROLLER_BUTTON_START } },
+        { BTN_CLEFT, { SDL_CONTROLLER_BUTTON_Y } },
+        { BTN_CRIGHT, { SDL_CONTROLLER_BUTTON_X } },
+        { BTN_CDOWN, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER } },
+        { BTN_CUP, { SDL_CONTROLLER_BUTTON_RIGHTSTICK } },
+        { BTN_DUP, { SDL_CONTROLLER_BUTTON_DPAD_UP } },
+        { BTN_DDOWN, { SDL_CONTROLLER_BUTTON_DPAD_DOWN } },
+        { BTN_DLEFT, { SDL_CONTROLLER_BUTTON_DPAD_LEFT } },
+        { BTN_DRIGHT, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT } },
+    });
+    return;
+#endif
     Ship::ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings({
         { BTN_A, { SDL_CONTROLLER_BUTTON_A } },
         { BTN_B, { SDL_CONTROLLER_BUTTON_B } },
@@ -92,6 +111,13 @@ void ControllerDefaultMappings::SetDefaultSDLAxisDirectionToButtonMappings(
         return;
     }
 
+#ifdef __SWITCH__
+    Ship::ControllerDefaultMappings::SetDefaultSDLAxisDirectionToButtonMappings({
+        { BTN_R, { { SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 1 } } },
+        { BTN_Z, { { SDL_CONTROLLER_AXIS_TRIGGERLEFT, 1 } } },
+    });
+    return;
+#endif
     Ship::ControllerDefaultMappings::SetDefaultSDLAxisDirectionToButtonMappings({
         { BTN_R, { { SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 1 } } },
         { BTN_Z, { { SDL_CONTROLLER_AXIS_TRIGGERLEFT, 1 } } },

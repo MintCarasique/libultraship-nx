@@ -6,6 +6,9 @@
 #include "ship/utils/StringHelper.h"
 #include <imgui.h>
 #include "ship/controller/controldevice/controller/mapping/mouse/WheelHandler.h"
+#ifdef __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
 
 namespace LUS {
 ControlDeck::ControlDeck(std::vector<CONTROLLERBUTTONS_T> additionalBitmasks,
@@ -56,6 +59,21 @@ void ControlDeck::WriteToPad(void* pad) {
 void ControlDeck::WriteToOSContPad(OSContPad* pad) {
     SDL_PumpEvents();
     Ship::WheelHandler::GetInstance()->Update();
+
+#ifdef __SWITCH__
+    // SDL keeps all 8 player slots "connected" and sends no events when controllers come and go,
+    // so watch the slots ourselves and refresh the device list when the set changes.
+    {
+        static uint32_t sLastSlots = UINT32_MAX;
+        const uint32_t slots = Ship::Switch::GetConnectedPadSlots();
+        if (slots != sLastSlots) {
+            if (sLastSlots != UINT32_MAX) {
+                GetConnectedPhysicalDeviceManager()->RefreshConnectedSDLGamepads();
+            }
+            sLastSlots = slots;
+        }
+    }
+#endif
 
     if (AllGameInputBlocked()) {
         return;

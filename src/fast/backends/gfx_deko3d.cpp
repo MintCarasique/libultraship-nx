@@ -477,6 +477,15 @@ struct GfxRenderingAPIDeko3d::Impl {
     FrameSlot* cur = nullptr;
     bool frameOpen = false;
 
+    // Uploads asked for between frames (ImGui windows load their images while building the UI,
+    // before the renderer opens a frame): kept here and done at the start of the next frame.
+    struct PendingUpload {
+        uint32_t texId;
+        uint32_t width, height;
+        std::vector<uint8_t> rgba;
+    };
+    std::vector<PendingUpload> pendingUploads;
+
     ImageHeap images;
     MemRing codeHeap;
     MemRing descMem; // image descriptors, then sampler descriptors
@@ -816,16 +825,33 @@ struct GfxRenderingAPIDeko3d::Impl {
         curFb = 0;
         vsYScale = 1.0f;
         BeginCommands();
+
+        if (!pendingUploads.empty()) {
+            const uint32_t savedTile = curTile;
+            const uint32_t savedTex = curTexIds[0];
+            std::vector<PendingUpload> uploads;
+            uploads.swap(pendingUploads);
+            for (auto& u : uploads) {
+                curTile = 0;
+                curTexIds[0] = u.texId;
+                UploadTexture(u.rgba.data(), u.width, u.height);
+            }
+            curTile = savedTile;
+            curTexIds[0] = savedTex;
+        }
     }
 
     void EndFrame() {
         if (!frameOpen) {
             return;
         }
-        // Debug screenshots over nxlink: every 15 s while the host log is connected
+        // Debug screenshots over nxlink: every 15 s while the host log is connected, only when
+        // turned on with the gDeveloperTools.NetScreenshots CVar (it costs a GPU sync per shot)
         static uint64_t lastShot = 0;
         const uint64_t now = armGetSystemTick();
         const bool shoot = Ship::SwitchProf::Enabled() && armTicksToNs(now - lastShot) > 15000000000ULL &&
+                           Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                               "gDeveloperTools.NetScreenshots", 0) != 0 &&
                            (uint64_t)swapWidth * swapHeight * 4 <= kReadbackSize;
         if (shoot) {
             lastShot = now;
@@ -1030,11 +1056,15 @@ struct GfxRenderingAPIDeko3d::Impl {
 
     void UploadTexture(const uint8_t* rgba, uint32_t w, uint32_t h) {
         SWITCH_PROF_DK(PROF_GL_TEX);
-        if (w == 0 || h == 0 || !frameOpen) {
+        if (w == 0 || h == 0) {
             return;
         }
         const uint32_t id = curTexIds[curTile];
         if (id == 0 || id >= textures.size()) {
+            return;
+        }
+        if (!frameOpen) {
+            pendingUploads.push_back({ id, w, h, std::vector<uint8_t>(rgba, rgba + (size_t)w * h * 4) });
             return;
         }
         TextureDk& t = textures[id];

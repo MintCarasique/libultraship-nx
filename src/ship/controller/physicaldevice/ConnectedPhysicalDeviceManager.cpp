@@ -1,5 +1,8 @@
 #include "ship/controller/physicaldevice/ConnectedPhysicalDeviceManager.h"
 #include <spdlog/spdlog.h>
+#ifdef __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
 
 namespace Ship {
 ConnectedPhysicalDeviceManager::ConnectedPhysicalDeviceManager() {
@@ -55,6 +58,13 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads() {
     static SDL_JoystickGUID sZeroGuid;
 
     for (int32_t i = 0; i < SDL_NumJoysticks(); i++) {
+#ifdef __SWITCH__
+        // SDL on the Switch always reports 8 joysticks, one per player slot (slot 1 also takes the
+        // handheld Joy-Cons). List only the slots that have a controller.
+        if (i < 8 && (Ship::Switch::GetConnectedPadSlots() & (1u << i)) == 0) {
+            continue;
+        }
+#endif
 
         SDL_JoystickGUID deviceGUID = SDL_JoystickGetDeviceGUID(i);
         if (SDL_memcmp(&deviceGUID, &sZeroGuid, sizeof(deviceGUID)) == 0) {

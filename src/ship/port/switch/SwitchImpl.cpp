@@ -119,6 +119,20 @@ bool Ship::Switch::IsRunning() {
     return sIsRunning;
 }
 
+uint32_t Ship::Switch::GetConnectedPadSlots() {
+    uint32_t slots = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        u32 styles = hidGetNpadStyleSet((HidNpadIdType)(HidNpadIdType_No1 + i));
+        if (i == 0) {
+            styles |= hidGetNpadStyleSet(HidNpadIdType_Handheld);
+        }
+        if (styles != 0) {
+            slots |= 1u << i;
+        }
+    }
+    return slots;
+}
+
 void Ship::Switch::GetDisplaySize(int* width, int* height) {
     switch (appletGetOperationMode()) {
         case DOCKED_MODE:
