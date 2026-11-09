@@ -30,6 +30,10 @@
 #include <SDL.h>
 #include "fast/backends/gfx_metal.h"
 #include "ship/utils/macUtils.h"
+#elif defined(__SWITCH__)
+#include <SDL2/SDL.h>
+#include <glad/glad.h>
+#include "ship/port/switch/SwitchImpl.h"
 #else
 #include <SDL2/SDL.h>
 #define GL_GLEXT_PROTOTYPES 1
@@ -219,6 +223,12 @@ void GfxWindowBackendSDL2::SetFullscreenImpl(bool on, bool call_callback) {
         return;
     }
 
+#ifdef __SWITCH__
+    // Always fullscreen on Switch; the window size is dictated by the operation mode
+    mFullScreen = true;
+    return;
+#endif
+
     int display_in_use = SDL_GetWindowDisplayIndex(mWnd);
     if (display_in_use < 0) {
         SPDLOG_WARN("Can't detect on which monitor we are. Probably out of display area?");
@@ -333,11 +343,20 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 
 #if defined(__APPLE__)
     bool use_opengl = strcmp(gfxApiName, "OpenGL") == 0;
+    constexpr bool use_deko3d = false;
+#elif defined(__SWITCH__)
+    // deko3d presents on the default NWindow itself: SDL only provides input and events
+    mUseDeko3d = strcmp(gfxApiName, "deko3d") == 0;
+    const bool use_deko3d = mUseDeko3d;
+    const bool use_opengl = !use_deko3d;
 #else
     constexpr bool use_opengl = true;
+    constexpr bool use_deko3d = false;
 #endif
 
-    if (use_opengl) {
+    if (use_deko3d) {
+        // nothing to configure: no GL context, no SDL renderer
+    } else if (use_opengl) {
         SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
         SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
@@ -350,6 +369,10 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+#elif defined(__SWITCH__)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 #endif
 
 #ifdef _WIN32
@@ -373,13 +396,20 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     char title[512];
     int len = snprintf(title, sizeof(title), "%s (%s)", gameName, gfxApiName);
 
+#ifdef __SWITCH__
+    // The Switch has a fixed framebuffer size per operation mode (docked / handheld)
+    Ship::Switch::GetDisplaySize(&mWindowWidth, &mWindowHeight);
+#endif
+
 #ifdef __IOS__
     Uint32 flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN;
 #else
     Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #endif
 
-    if (use_opengl) {
+    if (use_deko3d) {
+        // plain window
+    } else if (use_opengl) {
         flags = flags | SDL_WINDOW_OPENGL;
     } else {
         flags = flags | SDL_WINDOW_METAL;
@@ -404,14 +434,27 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         posY = 100;
     }
 
-    if (use_opengl) {
+    if (use_deko3d) {
+#ifdef __SWITCH__
+        window_impl.Deko3d = { mWnd };
+        window_impl.Backend = WindowBackend::FAST3D_SDL_DEKO3D;
+#endif
+    } else if (use_opengl) {
+#ifndef __SWITCH__
         SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
 
         if (startFullScreen) {
             SetFullscreenImpl(true, false);
         }
+#endif
 
         mCtx = SDL_GL_CreateContext(mWnd);
+
+#ifdef __SWITCH__
+        if (!gladLoadGLLoader(SDL_GL_GetProcAddress)) {
+            SPDLOG_ERROR("Failed to initialize glad");
+        }
+#endif
 
         SDL_GL_MakeCurrent(mWnd, mCtx);
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
@@ -437,6 +480,11 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         window_impl.Metal = { mWnd, mRenderer };
         window_impl.Backend = WindowBackend::FAST3D_SDL_METAL;
     }
+
+#ifdef __SWITCH__
+    // Applet hooks, recording and CPU profile; needs config/CVars, which are loaded by now
+    Ship::Switch::Init(Ship::PostInitPhase);
+#endif
 
     std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui())
         ->Init(window_impl);
@@ -525,7 +573,13 @@ void GfxWindowBackendSDL2::SetMouseCallbacks(bool (*onMouseButtonDown)(int btn),
 }
 
 void GfxWindowBackendSDL2::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
-#ifdef __APPLE__
+#if defined(__SWITCH__)
+    *width = mWindowWidth;
+    *height = mWindowHeight;
+    *posX = 0;
+    *posY = 0;
+    return;
+#elif defined(__APPLE__)
     SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
 #else
     SDL_GL_GetDrawableSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
@@ -534,6 +588,12 @@ void GfxWindowBackendSDL2::GetDimensions(uint32_t* width, uint32_t* height, int3
 }
 
 void GfxWindowBackendSDL2::SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) {
+#ifdef __SWITCH__
+    // The output size is fixed by the operation mode (docked 1080p / handheld 720p); ignore the
+    // generic "game mode" defaults (1280x800, meant for the Steam Deck)
+    Ship::Switch::GetDisplaySize(&mWindowWidth, &mWindowHeight);
+    return;
+#endif
     mWindowWidth = width;
     mWindowHeight = height;
     if (mWnd) {
@@ -639,7 +699,9 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
         case SDL_WINDOWEVENT:
             switch (event.window.event) {
                 case SDL_WINDOWEVENT_SIZE_CHANGED:
-#ifdef __APPLE__
+#if defined(__SWITCH__)
+                    Ship::Switch::GetDisplaySize(&mWindowWidth, &mWindowHeight);
+#elif defined(__APPLE__)
                     SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
 #else
                     SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
@@ -742,12 +804,28 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
 
     if (mVsyncEnabled != nextVsyncEnabled) {
         mVsyncEnabled = nextVsyncEnabled;
-        SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
-        SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
+        if (mCtx != nullptr) {
+            SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
+        }
+        if (mRenderer != nullptr) {
+            SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
+        }
     }
 
+#ifdef __SWITCH__
+    {
+        Ship::SwitchProfScope profScope(Ship::PROF_SWAP);
+        SyncFramerateWithTime();
+        // deko3d queues its present in GfxRenderingAPIDeko3d::EndFrame (and applies vsync itself)
+        if (!mUseDeko3d) {
+            SDL_GL_SwapWindow(mWnd);
+        }
+    }
+    Ship::SwitchProf::FrameEnd();
+#else
     SyncFramerateWithTime();
     SDL_GL_SwapWindow(mWnd);
+#endif
 }
 
 void GfxWindowBackendSDL2::SwapBuffersEnd() {
@@ -778,10 +856,17 @@ bool GfxWindowBackendSDL2::CanDisableVsync() {
 }
 
 bool GfxWindowBackendSDL2::IsRunning() {
+#ifdef __SWITCH__
+    return mIsRunning && Ship::Switch::IsRunning();
+#else
     return mIsRunning;
+#endif
 }
 
 void GfxWindowBackendSDL2::Destroy() {
+#ifdef __SWITCH__
+    Ship::Switch::Exit();
+#endif
     // TODO: destroy _any_ resources used by SDL
     SDL_GL_DeleteContext(mCtx);
     SDL_DestroyWindow(mWnd);

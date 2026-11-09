@@ -64,6 +64,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(cmake/dependencies/linux.cmake)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    include(cmake/dependencies/switch.cmake)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     include(cmake/dependencies/openbsd.cmake)
 endif()

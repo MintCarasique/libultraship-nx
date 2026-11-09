@@ -12,6 +12,9 @@
 #include "fast/backends/gfx_direct3d_common.h"
 #include "fast/backends/gfx_direct3d11.h"
 #include "fast/backends/gfx_window_manager_api.h"
+#ifdef __SWITCH__
+#include "fast/backends/gfx_deko3d.h"
+#endif
 
 #include "fast/Fast3dGui.h"
 
@@ -36,7 +39,15 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
         AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_METAL);
     }
 #endif
+#ifdef __SWITCH__
+    // deko3d only. The OpenGL path (Mesa nouveau in switch-mesa's libEGL) cannot coexist with the
+    // copy of Mesa inside uam: the linker merges their identically named COMDAT groups (inline
+    // functions, vtables) and libEGL's references end up in discarded sections, so GL context
+    // creation jumps to address 0. A saved OpenGL choice falls back to deko3d automatically.
+    AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_DEKO3D);
+#else
     AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+#endif
 }
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
@@ -74,7 +85,7 @@ void Fast3dWindow::Init() {
             }
         }
     }
-#elif defined(__ANDROID__) || defined(__IOS__)
+#elif defined(__ANDROID__) || defined(__IOS__) || defined(__SWITCH__)
     gameMode = true;
 #endif
 
@@ -152,6 +163,12 @@ void Fast3dWindow::InitWindowManager() {
 #ifdef __APPLE__
         case WindowBackend::FAST3D_SDL_METAL:
             mRenderingApi = new GfxRenderingAPIMetal();
+            mWindowManagerApi = new GfxWindowBackendSDL2();
+            break;
+#endif
+#ifdef __SWITCH__
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            mRenderingApi = new GfxRenderingAPIDeko3d();
             mWindowManagerApi = new GfxWindowBackendSDL2();
             break;
 #endif
@@ -299,7 +316,7 @@ uint32_t Fast3dWindow::GetCurrentRefreshRate() {
 }
 
 bool Fast3dWindow::SupportsWindowedFullscreen() {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__SWITCH__)
     return false;
 #endif
 
@@ -401,6 +418,8 @@ std::string Fast3dWindow::GetWindowBackendName() {
             return "OpenGL";
         case WindowBackend::FAST3D_SDL_METAL:
             return "Metal";
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            return "deko3d";
         default:
             return "";
     }

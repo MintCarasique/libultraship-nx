@@ -72,7 +72,7 @@ target_include_directories(libultraship
 
 #=================== Linking ===================
 if(INCLUDE_MPQ_SUPPORT)
-    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         target_link_libraries(libultraship PUBLIC "$<LINK_LIBRARY:WHOLE_ARCHIVE,storm>")
     else()
         target_link_libraries(libultraship PUBLIC storm)
@@ -84,6 +84,24 @@ target_link_libraries(libultraship
 )
 
 target_link_libraries(libultraship PRIVATE stb)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    # deko3d renderer: libdeko3d from libnx, uam (GLSL -> DKSH) from extern/uam
+    # libdeko3dd (debug) reports API misuse through the device's debug callback before aborting;
+    # the release library aborts silently. Bring-up uses the debug one.
+    option(LUS_DEKO3D_DEBUG "Link the debug deko3d library" OFF)
+    if (LUS_DEKO3D_DEBUG)
+        target_link_libraries(libultraship PUBLIC uam_private deko3dd)
+    else()
+        target_link_libraries(libultraship PUBLIC uam_private deko3d)
+    endif()
+
+    # Built-in copy of the deko3d shader template, used when the archive (soh.o2r) predates it
+    set(DK_TEMPLATE ${CMAKE_CURRENT_SOURCE_DIR}/fast/shaders/deko3d/default.shader.glsl)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${DK_TEMPLATE})
+    file(READ ${DK_TEMPLATE} DK_TEMPLATE_TEXT)
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/fast/deko3d_default_shader.inc "R\"DKTPL(${DK_TEMPLATE_TEXT})DKTPL\"\n")
+endif()
 
 if (GFX_DEBUG_DISASSEMBLER)
     target_link_libraries(libultraship PRIVATE libgfxd)

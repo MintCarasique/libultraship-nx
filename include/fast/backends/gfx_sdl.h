@@ -54,8 +54,9 @@ class GfxWindowBackendSDL2 final : public GfxWindowBackend {
 
     SDL_Window* mWnd;
     SDL_Rect mCursorClip;
-    SDL_GLContext mCtx;
-    SDL_Renderer* mRenderer;
+    SDL_GLContext mCtx = nullptr;
+    SDL_Renderer* mRenderer = nullptr;
+    bool mUseDeko3d = false; // Switch: deko3d renderer, SDL window without GL
     int mSdlToLusTable[512];
     float mMouseWheelX = 0.0f;
     float mMouseWheelY = 0.0f;

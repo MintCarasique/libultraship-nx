@@ -231,6 +231,11 @@ void Config::Save() {
             return;
         }
     }
+#ifdef __SWITCH__
+    // The Switch SD filesystem does not replace an existing file on rename (EEXIST)
+    std::error_code removeTargetEc;
+    fs::remove(configPath, removeTargetEc);
+#endif
     fs::rename(tempPath, configPath, ec);
     if (ec) {
         SPDLOG_ERROR("Could not replace config \"{}\": {}", mPath, ec.message());

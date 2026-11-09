@@ -43,6 +43,9 @@ typedef struct {
             uint32_t Width;  ///< Framebuffer width in pixels.
             uint32_t Height; ///< Framebuffer height in pixels.
         } Gx2;
+        struct {
+            void* Window; ///< SDL_Window* (input only; deko3d presents on the default NWindow)
+        } Deko3d;
     };
     WindowBackend Backend;
 } GuiWindowInitData;

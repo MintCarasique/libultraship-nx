@@ -22,6 +22,10 @@
 
 #if defined(__ANDROID__) || defined(__IOS__)
 #include "ship/port/mobile/MobileImpl.h"
+#elif defined(__SWITCH__)
+#include "ship/port/switch/SwitchImpl.h"
+#include "fast/backends/gfx_deko3d.h"
+#include <imgui_impl_sdl2.h>
 #endif
 
 #ifdef ENABLE_OPENGL
@@ -58,7 +62,7 @@ bool Fast3dGui::SupportsViewports() {
     }
 #endif
 
-#if defined(__ANDROID__) || defined(__IOS__)
+#if defined(__ANDROID__) || defined(__IOS__) || defined(__SWITCH__)
     return false;
 #endif
 
@@ -69,9 +73,12 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
     switch (mImpl.Backend) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
+        case WindowBackend::FAST3D_SDL_DEKO3D:
             ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
 #if defined(__ANDROID__) || defined(__IOS__)
             Ship::Mobile::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
+#elif defined(__SWITCH__)
+            Ship::Switch::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
 #endif
             break;
 #ifdef ENABLE_DX11
@@ -108,6 +115,16 @@ void Fast3dGui::ImGuiWMInit() {
             ImGui_ImplWin32_Init(mImpl.Dx11.Window);
             break;
 #endif
+#ifdef __SWITCH__
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            // Touch screen -> mouse events, as for the OpenGL backend
+            SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
+            if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
+                SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+            }
+            ImGui_ImplSDL2_InitForOther(static_cast<SDL_Window*>(mImpl.Deko3d.Window));
+            break;
+#endif
         default:
             break;
     }
@@ -118,6 +135,11 @@ void Fast3dGui::ImGuiWMInit() {
 
 void Fast3dGui::ImGuiWMShutdown() {
     switch (mImpl.Backend) {
+#ifdef __SWITCH__
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            ImGui_ImplSDL2_Shutdown();
+            break;
+#endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplSDL2_Shutdown();
@@ -168,6 +190,11 @@ void Fast3dGui::ImGuiBackendInit() {
                                 static_cast<ID3D11DeviceContext*>(mImpl.Dx11.DeviceContext));
             break;
 #endif
+#ifdef __SWITCH__
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            static_cast<GfxRenderingAPIDeko3d*>(mInterpreter.lock()->GetCurrentRenderingAPI())->ImGuiInit();
+            break;
+#endif
         default:
             break;
     }
@@ -175,6 +202,13 @@ void Fast3dGui::ImGuiBackendInit() {
 
 void Fast3dGui::ImGuiBackendShutdown() {
     switch (mImpl.Backend) {
+#ifdef __SWITCH__
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            if (auto interp = mInterpreter.lock()) {
+                static_cast<GfxRenderingAPIDeko3d*>(interp->GetCurrentRenderingAPI())->ImGuiShutdown();
+            }
+            break;
+#endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplOpenGL3_Shutdown();
@@ -197,6 +231,11 @@ void Fast3dGui::ImGuiBackendShutdown() {
 
 void Fast3dGui::ImGuiBackendNewFrame() {
     switch (mImpl.Backend) {
+#ifdef __SWITCH__
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            static_cast<GfxRenderingAPIDeko3d*>(mInterpreter.lock()->GetCurrentRenderingAPI())->ImGuiNewFrame();
+            break;
+#endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplOpenGL3_NewFrame();
@@ -225,6 +264,7 @@ void Fast3dGui::ImGuiWMNewFrame() {
     switch (mImpl.Backend) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
+        case WindowBackend::FAST3D_SDL_DEKO3D:
             ImGui_ImplSDL2_NewFrame();
             break;
 #ifdef ENABLE_DX11
@@ -240,7 +280,8 @@ void Fast3dGui::ImGuiWMNewFrame() {
 // Bind ImGui's SDL2 gamepad backend to the controller(s) the
 // ControlDeck has already opened
 void Fast3dGui::RefreshImGuiGamepads() {
-    if (mImpl.Backend != WindowBackend::FAST3D_SDL_OPENGL && mImpl.Backend != WindowBackend::FAST3D_SDL_METAL) {
+    if (mImpl.Backend != WindowBackend::FAST3D_SDL_OPENGL && mImpl.Backend != WindowBackend::FAST3D_SDL_METAL &&
+        mImpl.Backend != WindowBackend::FAST3D_SDL_DEKO3D) {
         return;
     }
 
@@ -248,7 +289,15 @@ void Fast3dGui::RefreshImGuiGamepads() {
 }
 
 void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
+#ifdef __SWITCH__
+    Ship::SwitchProfScope profScope(Ship::PROF_IMGUI);
+#endif
     switch (mImpl.Backend) {
+#ifdef __SWITCH__
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            static_cast<GfxRenderingAPIDeko3d*>(mInterpreter.lock()->GetCurrentRenderingAPI())->ImGuiRenderDrawData(data);
+            break;
+#endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplOpenGL3_RenderDrawData(data);

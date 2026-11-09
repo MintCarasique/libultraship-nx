@@ -48,6 +48,9 @@ if(INCLUDE_MPQ_SUPPORT)
     )
     FetchContent_MakeAvailable(StormLib)
     list(APPEND ADDITIONAL_LIB_INCLUDES ${stormlib_SOURCE_DIR}/src)
+    if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+        target_compile_definitions(storm PRIVATE -D_POSIX_C_SOURCE=200809L)
+    endif()
 endif()
 
 #=================== STB ===================

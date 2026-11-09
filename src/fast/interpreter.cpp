@@ -7,7 +7,9 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdio.h>
-#ifndef _WIN32
+#if defined(__SWITCH__)
+#include "ship/port/switch/SwitchImpl.h"
+#elif !defined(_WIN32)
 #include <dlfcn.h>
 #endif
 
@@ -3987,6 +3989,9 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
     HMODULE module = nullptr;
     return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                               reinterpret_cast<LPCSTR>(addr), &module) != 0;
+#elif defined(__SWITCH__)
+    // No dladdr on Switch; ask the kernel whether the address lies in a mapped code/data image.
+    return Ship::Switch::IsModuleAddress(addr);
 #else
     // For non-Windows platforms, check whether the address belongs to a loaded object.
     Dl_info info;

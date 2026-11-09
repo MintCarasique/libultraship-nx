@@ -293,6 +293,18 @@ bool Context::InitControlDeck(std::shared_ptr<ControlDeck> controlDeck) {
         SPDLOG_WARN("Failed to initialize SDL game controllers ({})", SDL_GetError());
     }
 
+#ifdef __SWITCH__
+    // devkitPro's SDL maps the Switch pad positionally (Xbox layout: physical B -> SDL A).
+    // Remap by label so the game's A/B and ImGui's confirm/cancel match the buttons' printing.
+    // Joystick buttons: b0=A b1=B b2=X b3=Y (HidNpadButton bit order).
+    if (SDL_GameControllerAddMapping(
+            "000038f853776974636820436f6e7400,Switch Controller,a:b0,b:b1,x:b2,y:b3,back:b11,dpdown:b15,"
+            "dpleft:b12,dpright:b14,dpup:b13,leftshoulder:b6,leftstick:b4,lefttrigger:b8,leftx:a0,lefty:a1,"
+            "rightshoulder:b7,rightstick:b5,righttrigger:b9,rightx:a2,righty:a3,start:b10,") < 0) {
+        SPDLOG_WARN("Failed to apply Switch controller mapping ({})", SDL_GetError());
+    }
+#endif
+
     return true;
 }
 

@@ -8,6 +8,14 @@
 #include <string>
 #include <string_view>
 
+// Default for CVAR_IMGUI_CONTROLLER_NAV. Consoles have no mouse/keyboard, so the menu
+// must be reachable (and navigable) with the controller out of the box.
+#ifdef __SWITCH__
+#define CVAR_IMGUI_CONTROLLER_NAV_DEFAULT 1
+#else
+#define CVAR_IMGUI_CONTROLLER_NAV_DEFAULT 0
+#endif
+
 namespace Ship {
 
 /** @brief Discriminator tag for the active field of the CVar union. */
