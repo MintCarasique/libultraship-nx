@@ -30,21 +30,70 @@
 static const uint32_t SWITCH_CPU_SPEEDS_VALUES[] = { 1785000000, 1581000000, 1224000000, 1020000000,
                                                      918000000,  816000000,  714000000 };
 
+// ---------------------------------------------------------------------------------------------
+// State machines of the platform layer. Each is one enum; transitions that matter for debugging
+// are logged as "[state] <machine>: <from> -> <to>" (SD card log and nxlink), so a log shows what
+// the port believed was going on. Overview: tools/switch/STATE_MACHINES.md in Shipwright-NX.
+// ---------------------------------------------------------------------------------------------
+
+// Applet integration (hooks, gameplay recording, clock services).
+//   Boot -> PreInit -> Running -> Exited (-> Running again if the window is re-created)
+enum class Lifecycle { Boot, PreInit, Running, Exited };
+
+// Who owns the CPU clock.
+//   Untouched: never written, or handed back. HOS / sys-clk decide. The default.
+//   Pinned:    we set sPinnedHz and the app is in focus.
+//   Yielded:   a pin is wanted (sPinnedHz) but the app is in the background, so the clock was
+//              put back to stock; it is pinned again when focus returns.
+enum class ClockState { Untouched, Pinned, Yielded };
+
+// Software keyboard. Unknown until the first ImGui event, which brings SDL in line.
+enum class KeyboardState { Unknown, Hidden, Shown };
+
+// nxlink log / profiler link. Offline and Lost are final; only Connected sends anything.
+enum class NetLogState { NotStarted, Offline, Connected, Lost };
+
+static const char* Name(Lifecycle s) {
+    static const char* const names[] = { "Boot", "PreInit", "Running", "Exited" };
+    return names[(int)s];
+}
+
+static const char* Name(ClockState s) {
+    static const char* const names[] = { "Untouched", "Pinned", "Yielded" };
+    return names[(int)s];
+}
+
 static AppletHookCookie sAppletHookCookie;
-static bool sIsRunning = true;
+static Lifecycle sLifecycle = Lifecycle::Boot;
+static bool sExitRequested = false; // latched by the applet hook, read by the main loop
 static bool sHasFocus = true;
-static bool sIsShowingVirtualKeyboard = true;
+static KeyboardState sKeyboard = KeyboardState::Unknown;
 static bool sClkrstInitialized = false;
+static ClockState sClockState = ClockState::Untouched;
+static uint32_t sPinnedHz = 0; // meaningful in Pinned and Yielded
+static std::atomic<NetLogState> sNetLog = NetLogState::NotStarted;
 
 static void OnAppletHook(AppletHookType hook, void* param);
 static void DetectAppletMode();
 static void StartNetLog();
 
-static uint32_t sTargetCpuHz = 0;
+static void SetLifecycle(Lifecycle next) {
+    if (next != sLifecycle) {
+        SPDLOG_INFO("[state] lifecycle: {} -> {}", Name(sLifecycle), Name(next));
+        sLifecycle = next;
+    }
+}
 
-static Result SetCpuClock(uint32_t hz) {
+static void SetClockState(ClockState next) {
+    if (next != sClockState) {
+        SPDLOG_INFO("[state] cpu-clock: {} -> {} ({} MHz)", Name(sClockState), Name(next), sPinnedHz / 1000000);
+        sClockState = next;
+    }
+}
+
+// Raw clock write; ownership is tracked by the callers through sClockState
+static Result WriteCpuClock(uint32_t hz) {
     Result rc = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
-    sTargetCpuHz = hz;
     if (hosversionBefore(8, 0, 0)) {
         rc = pcvSetClockRate(PcvModule_CpuBus, hz);
     } else if (sClkrstInitialized) {
@@ -58,14 +107,30 @@ static Result SetCpuClock(uint32_t hz) {
     return rc;
 }
 
+// Hands the CPU back at stock clocks, but only if we are the ones who changed them
+static void ReleaseCpuClock() {
+    if (sClockState == ClockState::Pinned) {
+        WriteCpuClock(SWITCH_CPU_SPEEDS_VALUES[Ship::STOCK]);
+    }
+    SetClockState(ClockState::Untouched);
+    sPinnedHz = 0;
+}
+
 void Ship::Switch::Init(SwitchPhase phase) {
     switch (phase) {
         case PreInitPhase:
+            if (sLifecycle != Lifecycle::Boot) {
+                break;
+            }
             // Must run before anything touches stdout (spdlog's console sink, printf)
             StartNetLog();
             DetectAppletMode();
+            SetLifecycle(Lifecycle::PreInit);
             break;
         case PostInitPhase:
+            if (sLifecycle == Lifecycle::Running) {
+                break; // already hooked
+            }
             appletInitializeGamePlayRecording();
             appletSetGamePlayRecordingState(true);
             appletHook(&sAppletHookCookie, OnAppletHook, NULL);
@@ -75,16 +140,17 @@ void Ship::Switch::Init(SwitchPhase phase) {
             } else {
                 sClkrstInitialized = R_SUCCEEDED(clkrstInitialize());
             }
+            SetLifecycle(Lifecycle::Running);
             ApplyOverclock();
             break;
     }
 }
 
 void Ship::Switch::Exit() {
-    // Hand the CPU back at stock clocks, but only if we changed them
-    if (sTargetCpuHz != 0) {
-        SetCpuClock(SWITCH_CPU_SPEEDS_VALUES[STOCK]);
+    if (sLifecycle != Lifecycle::Running) {
+        return; // nothing was hooked or initialized (or it is already undone)
     }
+    ReleaseCpuClock();
     if (hosversionBefore(8, 0, 0)) {
         pcvExit();
     } else if (sClkrstInitialized) {
@@ -93,30 +159,30 @@ void Ship::Switch::Exit() {
     }
     appletUnhook(&sAppletHookCookie);
     appletSetGamePlayRecordingState(false);
+    SetLifecycle(Lifecycle::Exited);
 }
 
 void Ship::Switch::ImGuiProcessEvent(bool wantsTextInput) {
-    ImGuiInputTextState* state = ImGui::GetInputTextState(ImGui::GetActiveID());
-
     if (wantsTextInput) {
-        if (!sIsShowingVirtualKeyboard) {
+        if (sKeyboard != KeyboardState::Shown) {
+            ImGuiInputTextState* state = ImGui::GetInputTextState(ImGui::GetActiveID());
             if (state != nullptr) {
                 state->ClearText();
             }
 
-            sIsShowingVirtualKeyboard = true;
+            sKeyboard = KeyboardState::Shown;
             SDL_StartTextInput();
         }
     } else {
-        if (sIsShowingVirtualKeyboard) {
-            sIsShowingVirtualKeyboard = false;
+        if (sKeyboard != KeyboardState::Hidden) {
+            sKeyboard = KeyboardState::Hidden;
             SDL_StopTextInput();
         }
     }
 }
 
 bool Ship::Switch::IsRunning() {
-    return sIsRunning;
+    return !sExitRequested;
 }
 
 uint32_t Ship::Switch::GetConnectedPadSlots() {
@@ -148,24 +214,38 @@ void Ship::Switch::GetDisplaySize(int* width, int* height) {
 }
 
 void Ship::Switch::ApplyOverclock() {
-    int32_t perfMode = CVarGetInteger(CVAR_SWITCH_PERF_MODE, (int32_t)SYSTEM_DEFAULT);
+    const int32_t perfMode = CVarGetInteger(CVAR_SWITCH_PERF_MODE, (int32_t)SYSTEM_DEFAULT);
 
-    if (perfMode == SYSTEM_DEFAULT) {
-        // Leave clock management to the system / sys-clk. If we pinned a clock earlier this
-        // session, hand the CPU back at stock once.
-        if (sTargetCpuHz != 0) {
-            SetCpuClock(SWITCH_CPU_SPEEDS_VALUES[STOCK]);
-            sTargetCpuHz = 0;
-        }
+    if (perfMode < 0 || perfMode > POWERSAVINGM3) {
+        // System Default (or a value we don't know): leave clock management to the system /
+        // sys-clk. If we pinned a clock earlier this session, hand the CPU back at stock once.
+        ReleaseCpuClock();
         SPDLOG_INFO("Switch perf mode: system default (clocks untouched)");
         return;
     }
 
-    if (perfMode >= 0 && perfMode <= POWERSAVINGM3) {
-        Result rc = SetCpuClock(SWITCH_CPU_SPEEDS_VALUES[perfMode]);
-        SPDLOG_INFO("Switch perf mode {} -> {} MHz (rc 0x{:x}, clkrst {})", perfMode,
-                    SWITCH_CPU_SPEEDS_VALUES[perfMode] / 1000000, rc, sClkrstInitialized);
+    const uint32_t hz = SWITCH_CPU_SPEEDS_VALUES[perfMode];
+    if (!sHasFocus) {
+        // In the background the clock stays at stock; the pin is applied when focus returns
+        if (sClockState == ClockState::Pinned) {
+            WriteCpuClock(SWITCH_CPU_SPEEDS_VALUES[STOCK]);
+        }
+        sPinnedHz = hz;
+        SetClockState(ClockState::Yielded);
+        return;
     }
+
+    const Result rc = WriteCpuClock(hz);
+    SPDLOG_INFO("Switch perf mode {} -> {} MHz (rc 0x{:x}, clkrst {})", perfMode, hz / 1000000, rc,
+                sClkrstInitialized);
+    if (R_SUCCEEDED(rc)) {
+        sPinnedHz = hz;
+        SetClockState(ClockState::Pinned);
+    } else if (sClockState == ClockState::Yielded) {
+        // The clock is at stock, where we left it when focus was lost: nothing of ours remains
+        ReleaseCpuClock();
+    }
+    // A failed write from Untouched or Pinned changed nothing, so the state stands
 }
 
 void Ship::Switch::PrintErrorMessageToScreen(const char* str, ...) {
@@ -195,18 +275,19 @@ void Ship::Switch::PrintErrorMessageToScreen(const char* str, ...) {
 static void OnAppletHook(AppletHookType hook, void* param) {
     switch (hook) {
         case AppletHookType_OnExitRequest:
-            sIsRunning = false;
+            SPDLOG_INFO("[state] lifecycle: exit requested");
+            sExitRequested = true;
             break;
 
         case AppletHookType_OnFocusState:
             sHasFocus = appletGetFocusState() == AppletFocusState_InFocus;
+            SPDLOG_INFO("[state] focus: {}", sHasFocus ? "in focus" : "background");
 
             if (!sHasFocus) {
                 // Drop our pinned clock while in the background (only if we pinned one)
-                if (sTargetCpuHz != 0) {
-                    const uint32_t target = sTargetCpuHz;
-                    SetCpuClock(SWITCH_CPU_SPEEDS_VALUES[Ship::STOCK]);
-                    sTargetCpuHz = target;
+                if (sClockState == ClockState::Pinned) {
+                    WriteCpuClock(SWITCH_CPU_SPEEDS_VALUES[Ship::STOCK]);
+                    SetClockState(ClockState::Yielded);
                 }
             } else {
                 Ship::Switch::ApplyOverclock();
@@ -222,6 +303,11 @@ static void OnAppletHook(AppletHookType hook, void* param) {
 
         case AppletHookType_OnPerformanceMode:
             Ship::Switch::ApplyOverclock();
+            break;
+
+        case AppletHookType_OnOperationMode:
+            // The window and the swapchain pick the new size up on their own (GetDisplaySize)
+            SPDLOG_INFO("[state] display: {}", appletGetOperationMode() == DOCKED_MODE ? "docked" : "handheld");
             break;
 
         default:
@@ -275,18 +361,15 @@ bool Ship::Switch::IsModuleAddress(uintptr_t addr) {
 // ---------------------------------------------------------------------------------------------
 // Network log + profiler
 // ---------------------------------------------------------------------------------------------
-static std::atomic<bool> sProfEnabled = false;
 static std::atomic<uint64_t> sProfAccum[Ship::PROF_COUNT];
 static std::atomic<uint32_t> sProfCalls[Ship::PROF_COUNT];
 static std::atomic<int> sAudioBuffered = 0;
 static int sAudioBufferedMin = INT32_MAX;
-static std::atomic<int> sNetLogClient = -1;
 
 // Raw write() to the nxlink-redirected stdout fd: bypasses stdio buffering so it is safe from
 // any thread, including the exception handler.
 static void NetLogWrite(const char* fmt, ...) {
-    int sock = sNetLogClient.load();
-    if (sock < 0) {
+    if (sNetLog.load() != NetLogState::Connected) {
         return;
     }
     char buf[1024];
@@ -300,9 +383,8 @@ static void NetLogWrite(const char* fmt, ...) {
     if (len >= (int)sizeof(buf)) {
         len = sizeof(buf) - 1;
     }
-    if (write(sock, buf, len) < 0) {
-        sNetLogClient = -1;
-        sProfEnabled = false;
+    if (write(STDOUT_FILENO, buf, len) < 0) {
+        sNetLog = NetLogState::Lost; // the host went away: stop sending and profiling
     }
 }
 
@@ -349,26 +431,24 @@ uintptr_t Ship::Switch::RelativeAddress(uintptr_t addr) {
 // When launched through nxlink with -s (host listening on 28771), stream stdout/stderr to the
 // host via the standard nxlinkStdio(). This runs at the very start, before any stdio use.
 static void StartNetLog() {
-    static bool started = false;
-    if (started || __nxlink_host.s_addr == 0) {
+    if (sNetLog.load() != NetLogState::NotStarted) {
         return;
     }
-    started = true;
-    if (R_FAILED(socketInitializeDefault())) {
+    sNetLog = NetLogState::Offline;
+    if (__nxlink_host.s_addr == 0 || R_FAILED(socketInitializeDefault())) {
         return;
     }
-    int sock = nxlinkStdio();
-    if (sock < 0) {
+    // nxlinkStdio() redirects stdout/stderr to the host: from here the link is STDOUT_FILENO
+    if (nxlinkStdio() < 0) {
         return;
     }
-    sNetLogClient = STDOUT_FILENO;
+    sNetLog = NetLogState::Connected;
     NetLogWrite("[netlog] nxlink connected, profiler on (mode: %s)\n",
                 appletGetOperationMode() == DOCKED_MODE ? "docked" : "handheld");
-    sProfEnabled = true;
 }
 
 bool Ship::SwitchProf::Enabled() {
-    return sProfEnabled.load(std::memory_order_relaxed);
+    return sNetLog.load(std::memory_order_relaxed) == NetLogState::Connected;
 }
 
 uint64_t Ship::SwitchProf::Now() {
@@ -381,12 +461,10 @@ void Ship::SwitchProf::Add(SwitchProfSlot slot, uint64_t startTick) {
 }
 
 void Ship::SwitchProf::NetLogWriteRaw(const char* data, size_t len) {
-    int sock = sNetLogClient.load();
-    while (sock >= 0 && len > 0) {
-        ssize_t n = write(sock, data, len);
+    while (len > 0 && sNetLog.load() == NetLogState::Connected) {
+        ssize_t n = write(STDOUT_FILENO, data, len);
         if (n <= 0) {
-            sNetLogClient = -1;
-            sProfEnabled = false;
+            sNetLog = NetLogState::Lost;
             return;
         }
         data += n;

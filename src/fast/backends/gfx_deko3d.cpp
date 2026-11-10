@@ -300,11 +300,11 @@ class ShaderCompiler {
         std::unique_lock<std::mutex> lock(mMutex);
         mJobStage = stage;
         mJobSource = &glsl;
-        mJobDone = false;
-        mHasJob = true;
+        mJob = Job::Queued;
         mCv.notify_all();
-        mCv.wait(lock, [this] { return mJobDone; });
+        mCv.wait(lock, [this] { return mJob == Job::Done; });
         std::vector<uint8_t> result = std::move(mJobResult);
+        mJob = Job::Idle;
         lock.unlock();
 
         if (!result.empty()) {
@@ -324,8 +324,8 @@ class ShaderCompiler {
         SPDLOG_INFO("deko3d: uam ready");
         while (true) {
             std::unique_lock<std::mutex> lock(mMutex);
-            mCv.wait(lock, [this] { return mHasJob; });
-            mHasJob = false;
+            mCv.wait(lock, [this] { return mJob == Job::Queued; });
+            mJob = Job::Compiling;
             const uam::Stage stage = mJobStage;
             const std::string* src = mJobSource;
             lock.unlock();
@@ -345,7 +345,7 @@ class ShaderCompiler {
 
             lock.lock();
             mJobResult = r.ok ? std::move(r.dksh) : std::vector<uint8_t>();
-            mJobDone = true;
+            mJob = Job::Done;
             mCv.notify_all();
         }
     }
@@ -355,8 +355,10 @@ class ShaderCompiler {
     std::string mCacheDir;
     std::mutex mMutex;
     std::condition_variable mCv;
-    bool mHasJob = false;
-    bool mJobDone = false;
+    // The single job slot (one caller at a time: the render thread).
+    //   Idle -> Queued (Get) -> Compiling (worker) -> Done (worker) -> Idle (Get takes the result)
+    enum class Job : uint8_t { Idle, Queued, Compiling, Done };
+    Job mJob = Job::Idle;
     uam::Stage mJobStage = uam::Stage::Vertex;
     const std::string* mJobSource = nullptr;
     std::vector<uint8_t> mJobResult;
@@ -388,6 +390,11 @@ struct ShaderProgramDk {
     std::string vsSrc, fsSrc;
 };
 
+// A texture slot (index = texture id = image descriptor slot) goes through:
+//   free (!allocated) -> allocated, no image -> hasImage (re-uploaded any number of times)
+//   -> DeleteTexture: reset to free at once, but the id and the image memory only return to their
+//      pools when the frame slot that may still use them comes round again (DeferredFree).
+// isFramebuffer slots belong to a FramebufferDk and are never deleted through DeleteTexture.
 struct TextureDk {
     bool allocated = false;
     bool hasImage = false;
@@ -438,6 +445,22 @@ struct FrameSlot {
     std::vector<DeferredFree> deferred;
 };
 
+// Where the renderer is in its frame cycle; decides where commands may go.
+//   Idle:      between EndFrame and StartFrame. No command list is open and the previous frame
+//              may still be running on the GPU: nothing may be recorded, texture uploads are
+//              queued (pendingUploads) and descriptors are written straight to memory.
+//   Recording: StartFrame..EndFrame, commands go to the frame slot's list.
+//   Immediate: a read-back asked for while Idle, on its own small command list.
+//   Idle -> Recording -> Idle;  Idle -> Immediate -> Idle
+enum class FramePhase : uint8_t { Idle, Recording, Immediate };
+
+// Barrier owed before the next draw. Ordered: a stronger request replaces a weaker one.
+enum class Barrier : uint8_t { None, Fragments, Full };
+
+// ImGui renderer resources. Failed is final: the shaders did not compile and will not next
+// frame either, so the UI is skipped instead of retrying every frame.
+enum class ImGuiState : uint8_t { Uninitialized, Ready, Failed };
+
 constexpr const char* kImGuiVs = R"(#version 460
 layout(location = 0) in vec2 aPos;
 layout(location = 1) in vec2 aUv;
@@ -475,7 +498,10 @@ struct GfxRenderingAPIDeko3d::Impl {
     FrameSlot slots[kFramesInFlight];
     uint32_t frameIndex = 0; // monotonic
     FrameSlot* cur = nullptr;
-    bool frameOpen = false;
+    FramePhase phase = FramePhase::Idle;
+    bool Recording() const {
+        return phase == FramePhase::Recording;
+    }
 
     // Uploads asked for between frames (ImGui windows load their images while building the UI,
     // before the renderer opens a frame): kept here and done at the start of the next frame.
@@ -537,10 +563,9 @@ struct GfxRenderingAPIDeko3d::Impl {
     bool shadersDirty = true, texturesDirty = true;
     DkResHandle boundHandles[SHADER_MAX_TEXTURES] = {};
     bool shaderCodeDirty = false;
-    bool barrierPending = false;
     // Copies (texture uploads) run on the copy engine and blits on the 2D engine: a Fragments
     // barrier only waits for 3D work, so their results need a Full barrier before sampling.
-    bool barrierPendingFull = false;
+    Barrier pendingBarrier = Barrier::None;
     uint64_t barrierEpoch = 1;
 
     FilteringMode filterMode = FILTER_THREE_POINT;
@@ -549,7 +574,7 @@ struct GfxRenderingAPIDeko3d::Impl {
     float noiseScale = 1.0f;
 
     // ImGui
-    bool imguiReady = false;
+    ImGuiState imguiState = ImGuiState::Uninitialized;
     ShaderProgramDk imguiProg;
     uint32_t imguiFontTex = 0;
 
@@ -639,7 +664,7 @@ struct GfxRenderingAPIDeko3d::Impl {
             dkImageInitialize(&t0.image, &layout, images.Mem(t0.mem), t0.mem.offset);
             t0.width = t0.height = 1;
             WriteImageDescriptor(0, t0.image);
-            barrierPending = false;
+            pendingBarrier = Barrier::None;
         }
         fbs.resize(1); // framebuffer 0 = swapchain
         compiler.Start();
@@ -821,7 +846,7 @@ struct GfxRenderingAPIDeko3d::Impl {
 
         frameCount++;
         fsParams.frameCount = frameCount;
-        frameOpen = true;
+        phase = FramePhase::Recording;
         curFb = 0;
         vsYScale = 1.0f;
         BeginCommands();
@@ -832,6 +857,9 @@ struct GfxRenderingAPIDeko3d::Impl {
             std::vector<PendingUpload> uploads;
             uploads.swap(pendingUploads);
             for (auto& u : uploads) {
+                if (u.texId >= textures.size() || !textures[u.texId].allocated) {
+                    continue; // deleted while its upload was waiting for a frame
+                }
                 curTile = 0;
                 curTexIds[0] = u.texId;
                 UploadTexture(u.rgba.data(), u.width, u.height);
@@ -842,7 +870,7 @@ struct GfxRenderingAPIDeko3d::Impl {
     }
 
     void EndFrame() {
-        if (!frameOpen) {
+        if (!Recording()) {
             return;
         }
         // Debug screenshots over nxlink: every 15 s while the host log is connected, only when
@@ -877,7 +905,7 @@ struct GfxRenderingAPIDeko3d::Impl {
             SendScreenshot(readback.cpu, swapWidth, swapHeight);
         }
         cur->submitted = true;
-        frameOpen = false;
+        phase = FramePhase::Idle;
         DKTRACE("frame %u done", frameIndex);
         if (gDkTraceFrames > 0) {
             gDkTraceFrames--;
@@ -919,7 +947,7 @@ struct GfxRenderingAPIDeko3d::Impl {
     // Submits what was recorded, waits for the GPU and starts a new command list on the same
     // slot (used for read-backs and when a ring runs out of space).
     void FlushAndWait() {
-        if (!frameOpen) {
+        if (!Recording()) {
             return;
         }
         CheckQueue("flush");
@@ -935,7 +963,7 @@ struct GfxRenderingAPIDeko3d::Impl {
     // waited for); between frames (the game asks for pixel depth from its update) they get a
     // small command list of their own, after everything already submitted.
     void BeginReadback() {
-        if (frameOpen) {
+        if (Recording()) {
             RequestBarrier();
             EmitPendingBarrier();
             return;
@@ -945,11 +973,12 @@ struct GfxRenderingAPIDeko3d::Impl {
         dkCmdBufClear(cmdbuf);
         s->extraCmdUsed = 0;
         dkCmdBufAddMemory(cmdbuf, immCmdMem, 0, 256 * 1024);
+        phase = FramePhase::Immediate;
         dkCmdBufBarrier(cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
     }
 
     void EndReadback() {
-        if (frameOpen) {
+        if (Recording()) {
             FlushAndWait();
             return;
         }
@@ -958,6 +987,7 @@ struct GfxRenderingAPIDeko3d::Impl {
         dkQueueSubmitCommands(queue, list);
         dkQueueFlush(queue);
         dkQueueWaitIdle(queue);
+        phase = FramePhase::Idle;
     }
 
     uint32_t UploadAlloc(uint32_t size, uint32_t align, uint8_t** cpuOut, DkGpuAddr* gpuOut) {
@@ -994,22 +1024,23 @@ struct GfxRenderingAPIDeko3d::Impl {
     // A barrier before the next draw: makes uploads/copies/descriptor writes and render-target
     // writes visible to texture sampling.
     void RequestBarrier() {
-        barrierPending = true;
+        pendingBarrier = std::max(pendingBarrier, Barrier::Fragments);
     }
 
     void RequestFullBarrier() {
-        barrierPending = true;
-        barrierPendingFull = true;
+        pendingBarrier = Barrier::Full;
     }
 
+    // Outside a frame there is no command list to put the barrier in: it stays owed and goes
+    // out before the first draw of the next frame.
     void EmitPendingBarrier() {
-        if (barrierPending) {
-            dkCmdBufBarrier(cmdbuf, barrierPendingFull ? DkBarrier_Full : DkBarrier_Fragments,
-                            DkInvalidateFlags_Image | DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-            barrierPending = false;
-            barrierPendingFull = false;
-            barrierEpoch++;
+        if (pendingBarrier == Barrier::None || !Recording()) {
+            return;
         }
+        dkCmdBufBarrier(cmdbuf, pendingBarrier == Barrier::Full ? DkBarrier_Full : DkBarrier_Fragments,
+                        DkInvalidateFlags_Image | DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+        pendingBarrier = Barrier::None;
+        barrierEpoch++;
     }
 
     // ------------------------------------------------------------------ textures
@@ -1037,7 +1068,7 @@ struct GfxRenderingAPIDeko3d::Impl {
         dkImageViewDefaults(&view, &image);
         DkImageDescriptor desc;
         dkImageDescriptorInitialize(&desc, &view, false, false);
-        if (frameOpen) {
+        if (Recording()) {
             dkCmdBufPushData(cmdbuf, imageDescAddr + id * sizeof(DkImageDescriptor), &desc, sizeof(desc));
         } else {
             memcpy(descMem.cpu + id * sizeof(DkImageDescriptor), &desc, sizeof(desc));
@@ -1048,9 +1079,17 @@ struct GfxRenderingAPIDeko3d::Impl {
     // Before overwriting a texture slot's descriptor or image: if a draw since the last barrier
     // sampled it, those draws must finish first.
     void GuardTextureWrite(TextureDk& t) {
-        if (t.lastUseSerial == barrierEpoch) {
-            barrierPending = true;
+        if (t.lastUseSerial != barrierEpoch) {
+            return;
+        }
+        if (Recording()) {
+            RequestBarrier();
             EmitPendingBarrier();
+        } else {
+            // Between frames the draws that sampled it are in the frame just submitted, and a
+            // barrier cannot be recorded: wait for the GPU instead (rare: a framebuffer resize).
+            dkQueueWaitIdle(queue);
+            barrierEpoch++;
         }
     }
 
@@ -1063,7 +1102,7 @@ struct GfxRenderingAPIDeko3d::Impl {
         if (id == 0 || id >= textures.size()) {
             return;
         }
-        if (!frameOpen) {
+        if (!Recording()) {
             pendingUploads.push_back({ id, w, h, std::vector<uint8_t>(rgba, rgba + (size_t)w * h * 4) });
             return;
         }
@@ -1167,7 +1206,7 @@ struct GfxRenderingAPIDeko3d::Impl {
             w = dw;
             h = dh;
             if (!swapchain || w != swapWidth || h != swapHeight) {
-                if (frameOpen) {
+                if (Recording()) {
                     SPDLOG_WARN("deko3d: swapchain resize requested mid-frame; deferred");
                 } else {
                     CreateSwapchain(w, h);
@@ -1213,7 +1252,7 @@ struct GfxRenderingAPIDeko3d::Impl {
         fb.height = h;
         fb.invertY = invertY;
         fb.hasDepth = hasDepth;
-        if (id == curFb && frameOpen) {
+        if (id == curFb && Recording()) {
             BindFramebufferTargets(id);
         }
     }
@@ -1250,7 +1289,7 @@ struct GfxRenderingAPIDeko3d::Impl {
         curFb = id;
         // Offscreen targets keep OpenGL's row order (y negated); framebuffer 0 is presented upright
         vsYScale = id == 0 ? 1.0f : -1.0f;
-        if (frameOpen) {
+        if (Recording()) {
             BindFramebufferTargets(id);
         }
     }
@@ -1267,6 +1306,9 @@ struct GfxRenderingAPIDeko3d::Impl {
 
     void ClearFramebuffer(bool color, bool depth) {
         SWITCH_PROF_DK(PROF_GL_OTHER);
+        if (!Recording()) {
+            return;
+        }
         const FramebufferDk& fb = fbs[curFb];
         DkScissor full = { 0, 0, fb.width, fb.height };
         dkCmdBufSetScissors(cmdbuf, 0, &full, 1);
@@ -1282,7 +1324,7 @@ struct GfxRenderingAPIDeko3d::Impl {
     void ClearDepthRegion(int x, int y, int w, int h) {
         SWITCH_PROF_DK(PROF_GL_OTHER);
         const FramebufferDk& fb = fbs[curFb];
-        if (!fb.hasDepthImage) {
+        if (!Recording() || !fb.hasDepthImage) {
             return;
         }
         ToTargetRect(curFb, x, y, w, h);
@@ -1306,7 +1348,7 @@ struct GfxRenderingAPIDeko3d::Impl {
     void CopyFramebuffer(int dstId, int srcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) {
         SWITCH_PROF_DK(PROF_GL_OTHER);
-        if (dstId >= (int)fbs.size() || srcId >= (int)fbs.size()) {
+        if (!Recording() || dstId >= (int)fbs.size() || srcId >= (int)fbs.size()) {
             return;
         }
         const FramebufferDk& src = fbs[srcId];
@@ -1776,7 +1818,7 @@ struct GfxRenderingAPIDeko3d::Impl {
 
     void DrawTriangles(float* vbo, size_t lenFloats, size_t numTris) {
         SWITCH_PROF_DK(PROF_GL_DRAW);
-        if (!frameOpen || !curProg || !curProg->valid || numTris == 0) {
+        if (!Recording() || !curProg || !curProg->valid || numTris == 0) {
             return;
         }
         uint8_t* cpu;
@@ -1849,23 +1891,24 @@ struct GfxRenderingAPIDeko3d::Impl {
         curTile = savedTile;
         curTexIds[0] = savedTex;
         io.Fonts->SetTexID(reinterpret_cast<ImTextureID>((uintptr_t)imguiFontTex));
-        imguiReady = imguiProg.valid;
-        if (!imguiReady) {
-            SPDLOG_CRITICAL("deko3d: ImGui shaders failed to compile");
+        imguiState = imguiProg.valid ? ImGuiState::Ready : ImGuiState::Failed;
+        if (imguiState == ImGuiState::Failed) {
+            SPDLOG_CRITICAL("deko3d: ImGui shaders failed to compile; menus and popups will not be drawn");
         }
     }
 
     void ImGuiRender(ImDrawData* dd) {
         SWITCH_PROF_DK(PROF_IMGUI);
-        if (!frameOpen) {
+        if (!Recording()) {
             return;
         }
-        if (!imguiReady) {
+        if (imguiState == ImGuiState::Uninitialized) {
             ImGuiSetup();
-            if (!imguiReady) {
-                return;
-            }
-        } else if (ImGui::GetIO().Fonts->TexID == (ImTextureID)0) {
+        }
+        if (imguiState != ImGuiState::Ready) {
+            return;
+        }
+        if (ImGui::GetIO().Fonts->TexID == (ImTextureID)0) {
             // The font atlas was rebuilt (e.g. a font size change): upload it again
             ImGuiIO& io = ImGui::GetIO();
             unsigned char* pixels;
